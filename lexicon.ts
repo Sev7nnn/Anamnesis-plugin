@@ -255,7 +255,28 @@ export function mdToNotionBlocks(md: string): any[] {
 
     // Image ![alt](url)
     const img = trimmed.match(/^!\[([^\]]*)\]\(([^)]+)\)$/);
-    if (img) { blocks.push({ object: 'block', type: 'image', image: { type: 'external', external: { url: img[2] } } }); i++; continue; }
+    if (img) {
+      const alt = img[1] || 'sans titre';
+      const url = img[2];
+      if (/^https?:\/\//i.test(url)) {
+        // URL publique → vraie image Notion
+        blocks.push({ object: 'block', type: 'image', image: { type: 'external', external: { url } } });
+      } else {
+        // Image locale (stockage Obsidian) : non hébergeable dans Notion.
+        // → callout de disclaimer + lien vers le chemin, pour ne pas perdre la référence.
+        blocks.push({
+          object: 'block', type: 'callout',
+          callout: {
+            icon: { type: 'emoji', emoji: '🖼️' },
+            rich_text: [
+              { type: 'text', text: { content: `Image « ${alt} » — stockée dans le vault Obsidian, non hébergée dans Notion. Chemin : ` } },
+              { type: 'text', text: { content: url }, annotations: { code: true } },
+            ],
+          },
+        });
+      }
+      i++; continue;
+    }
 
     // Équation $$…$$
     const eq = trimmed.match(/^\$\$(.+)\$\$$/);
