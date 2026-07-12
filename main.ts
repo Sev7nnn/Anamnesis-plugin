@@ -11,6 +11,8 @@ interface NotionSyncSettings {
 	filteredPageIds: string[]; // List of Notion page IDs to exclude from sync
 	syncedPages: Record<string, { path: string; lastModified: string; notionId: string }>;
 	syncedImages: Record<string, { path: string; notionUrl: string; hash: string }>; // Track synced images
+	scopePageIds: string[]; // si non vide : ne synchronise QUE ces pages (cadrage / test)
+	syncOnStartup: boolean; // lance une synchro peu après le chargement du plugin
 }
 
 const DEFAULT_SETTINGS: NotionSyncSettings = {
@@ -22,7 +24,9 @@ const DEFAULT_SETTINGS: NotionSyncSettings = {
 	imageFolderPath: 'attachments',
 	filteredPageIds: [],
 	syncedPages: {},
-	syncedImages: {}
+	syncedImages: {},
+	scopePageIds: [],
+	syncOnStartup: false
 }
 
 interface NotionPage {
@@ -91,6 +95,11 @@ export default class ObsidiantionPlugin extends Plugin {
 
 		// Start automatic sync if configured
 		this.startAutoSync();
+
+		// Sync au démarrage (option) : un passage peu après le chargement du plugin
+		if (this.settings.syncOnStartup && this.settings.notionSecret) {
+			window.setTimeout(() => this.syncAllPages(), 3000);
+		}
 	}
 
 	onunload() {
@@ -140,6 +149,12 @@ export default class ObsidiantionPlugin extends Plugin {
 			return;
 		}
 
+		// Cadrage : si scopePageIds est défini, ne synchronise QUE ces pages (test / périmètre)
+		if (this.settings.scopePageIds && this.settings.scopePageIds.length > 0) {
+			await this.syncScopedPages(this.settings.scopePageIds);
+			return;
+		}
+
 		try {
 			// Debug: Log current settings
 			console.log('Current plugin settings:', {
@@ -172,6 +187,25 @@ export default class ObsidiantionPlugin extends Plugin {
 			console.error('Sync failed:', error);
 			new Notice(`Sync failed: ${error.message}`);
 		}
+	}
+
+	// Synchronise uniquement les pages listées (cadrage / test), sans parcourir tout le workspace.
+	async syncScopedPages(ids: string[]) {
+		new Notice(`Sync cadré : ${ids.length} page(s)...`);
+		for (const id of ids) {
+			try {
+				const meta = await this.makeNotionRequest(`pages/${id}`);
+				const title = this.extractPageTitle(meta);
+				const page: NotionPage = { id, title, lastModified: meta.last_edited_time, type: 'page' };
+				const filePath = this.buildFullPath(`${this.sanitizeFileName(title)}.md`);
+				await this.syncPageToFile(page, filePath);
+			} catch (e) {
+				console.error(`Sync cadré échoué pour ${id}:`, e);
+			}
+		}
+		this.settings.lastSyncTime = Date.now();
+		await this.saveSettings();
+		new Notice(`Sync cadré terminé (${ids.length} page(s)).`);
 	}
 
 	async getAllNotionPages(): Promise<NotionPage[]> {
