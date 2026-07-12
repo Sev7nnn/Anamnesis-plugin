@@ -1,5 +1,5 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, requestUrl } from 'obsidian';
-import { blocksToMarkdown, NBlock } from './lexicon';
+import { blocksToMarkdown, mdToNotionBlocks, NBlock } from './lexicon';
 
 interface NotionSyncSettings {
 	notionSecret: string;
@@ -47,6 +47,8 @@ interface NotionBlock {
 export default class ObsidiantionPlugin extends Plugin {
 	settings: NotionSyncSettings;
 	syncIntervalId: number | null = null;
+	suppressPush: Set<string> = new Set(); // chemins écrits par le pull (à ne pas re-pousser)
+	pushTimers: Record<string, number> = {}; // debounce du push par fichier
 
 	async onload() {
 		await this.loadSettings();
@@ -100,6 +102,24 @@ export default class ObsidiantionPlugin extends Plugin {
 		if (this.settings.syncOnStartup && this.settings.notionSecret) {
 			window.setTimeout(() => this.syncAllPages(), 3000);
 		}
+
+		// Push vault → Notion à la modification d'un .md (debounce + anti-boucle avec le pull)
+		this.registerEvent(this.app.vault.on('modify', (file) => {
+			if (!(file instanceof TFile) || file.extension !== 'md') return;
+			if (this.suppressPush.has(file.path)) { this.suppressPush.delete(file.path); return; }
+			if (this.pushTimers[file.path]) window.clearTimeout(this.pushTimers[file.path]);
+			this.pushTimers[file.path] = window.setTimeout(() => { this.pushNote(file); }, 2000);
+		}));
+
+		// Commande manuelle : pousser la note active vers Notion
+		this.addCommand({
+			id: 'push-note-to-notion',
+			name: 'Push current note to Notion',
+			callback: async () => {
+				const f = this.app.workspace.getActiveFile();
+				if (f) await this.pushNote(f);
+			}
+		});
 	}
 
 	onunload() {
@@ -206,6 +226,48 @@ export default class ObsidiantionPlugin extends Plugin {
 		this.settings.lastSyncTime = Date.now();
 		await this.saveSettings();
 		new Notice(`Sync cadré terminé (${ids.length} page(s)).`);
+	}
+
+	// Push vault → Notion : remplace le contenu de la page Notion par les blocs du .md.
+	async pushNote(file: TFile) {
+		if (!this.settings.notionSecret) return;
+		try {
+			const raw = await this.app.vault.read(file);
+			const fm = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+			const pageId = fm?.[1].match(/notion_id:\s*"?([0-9a-fA-F-]{32,})"?/)?.[1];
+			if (!pageId) { new Notice(`Push ignoré (pas de notion_id) : ${file.name}`); return; }
+
+			// corps sans frontmatter ni titre H1 initial (évite le double titre)
+			let body = raw.replace(/^---\n[\s\S]*?\n---\n?/, '');
+			body = body.replace(/^\s*#\s+.*\n+/, '');
+
+			// garde-fou conflit : Notion modifié depuis notre dernier sync ?
+			const rec = this.settings.syncedPages[pageId];
+			const page = await this.makeNotionRequest(`pages/${pageId}`);
+			if (rec && page.last_edited_time > rec.lastModified) {
+				new Notice(`⚠️ Conflit : « ${file.basename} » a changé côté Notion — push annulé.`);
+				return;
+			}
+
+			const blocks = mdToNotionBlocks(body);
+
+			// remplace : archive les blocs existants (page 1), puis ajoute les nouveaux
+			const existing = await this.makeNotionRequest(`blocks/${pageId}/children?page_size=100`);
+			for (const b of existing.results) {
+				await this.makeNotionRequest(`blocks/${b.id}`, 'DELETE');
+			}
+			for (let k = 0; k < blocks.length; k += 100) {
+				await this.makeNotionRequest(`blocks/${pageId}/children`, 'PATCH', { children: blocks.slice(k, k + 100) });
+			}
+
+			const updated = await this.makeNotionRequest(`pages/${pageId}`);
+			this.settings.syncedPages[pageId] = { path: file.path, lastModified: updated.last_edited_time, notionId: pageId };
+			await this.saveSettings();
+			new Notice(`Poussé vers Notion : ${file.basename}`);
+		} catch (e: any) {
+			console.error('pushNote échoué :', e);
+			new Notice(`Push échoué : ${e.message}`);
+		}
 	}
 
 	async getAllNotionPages(): Promise<NotionPage[]> {
@@ -595,6 +657,7 @@ export default class ObsidiantionPlugin extends Plugin {
 			// Get page content from Notion
 			const content = await this.getPageContent(page);
 
+			this.suppressPush.add(filePath); // écrit par le pull → ne pas re-pousser
 			if (existingFile instanceof TFile) {
 				// Update existing file
 				await this.app.vault.modify(existingFile, content);
