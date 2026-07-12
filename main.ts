@@ -1,4 +1,5 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, TFolder, requestUrl } from 'obsidian';
+import { blocksToMarkdown, NBlock } from './lexicon';
 
 interface NotionSyncSettings {
 	notionSecret: string;
@@ -583,10 +584,13 @@ export default class ObsidiantionPlugin extends Plugin {
 
 	async getPageContent(page: NotionPage): Promise<string> {
 		try {
-			const blocks = await this.getPageBlocks(page.id);
+			const tree = await this.getRawBlockTree(page.id);
+			await this.localizeImages(tree);
 			const properties = await this.getPageProperties(page.id);
 
-			let content = `# ${page.title}\n\n`;
+			// Frontmatter : ancre l'identité Notion dans le fichier (canonique, MCP-ready)
+			let content = `---\nnotion_id: ${page.id}\nnotion_synced: ${new Date().toISOString()}\n---\n\n`;
+			content += `# ${page.title}\n\n`;
 
 			// Add tags from select properties
 			const tags = this.extractTagsFromProperties(properties);
@@ -594,8 +598,8 @@ export default class ObsidiantionPlugin extends Plugin {
 				content += tags.map(tag => `#${tag}`).join(' ') + '\n\n';
 			}
 
-			content += `> Synced from Notion on ${new Date().toISOString()}\n\n`;
-			content += this.convertBlocksToMarkdown(blocks);
+			// Conversion via le lexique (source unique) sur l'arbre brut
+			content += blocksToMarkdown(tree);
 			return content;
 		} catch (error) {
 			console.error(`Failed to get content for page ${page.title}:`, error);
@@ -625,6 +629,48 @@ export default class ObsidiantionPlugin extends Plugin {
 		} while (cursor);
 
 		return blocks;
+	}
+
+	// Arbre BRUT des blocs Notion (enfants attachés sous .children), pour le lexique.
+	// Ne pré-convertit pas : le rendu Markdown est délégué à lexicon.ts.
+	async getRawBlockTree(blockId: string): Promise<NBlock[]> {
+		const blocks: NBlock[] = [];
+		let cursor: string | undefined;
+		do {
+			const params = new URLSearchParams();
+			params.append('page_size', '100');
+			if (cursor) params.append('start_cursor', cursor);
+			const response = await this.makeNotionRequest(`blocks/${blockId}/children?${params.toString()}`);
+			for (const block of response.results) {
+				if (block.has_children) {
+					block.children = await this.getRawBlockTree(block.id);
+				}
+				blocks.push(block as NBlock);
+			}
+			cursor = response.next_cursor || undefined;
+		} while (cursor);
+		return blocks;
+	}
+
+	// Télécharge les images en local et réécrit leur URL dans l'arbre
+	// (les URLs de fichiers Notion expirent → indispensable pour ne pas casser les images).
+	async localizeImages(blocks: NBlock[]): Promise<void> {
+		for (const b of blocks) {
+			if (b.type === 'image') {
+				const img: any = (b as any).image;
+				const url = img?.type === 'external' ? img?.external?.url : img?.file?.url;
+				const caption = img?.caption?.length ? this.extractRichText(img.caption) : '';
+				if (url) {
+					try {
+						const local = await this.downloadAndSaveImage(url, caption);
+						if (local) (b as any).image = { type: 'external', external: { url: local }, caption: img?.caption };
+					} catch (e) {
+						console.warn('localizeImages: échec téléchargement image', e);
+					}
+				}
+			}
+			if (b.children) await this.localizeImages(b.children as NBlock[]);
+		}
 	}
 
 	async getPageProperties(pageId: string): Promise<any> {
